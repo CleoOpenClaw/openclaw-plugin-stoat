@@ -1,0 +1,11 @@
+{
+  "id": "stoat",
+  "channels": [
+    "stoat"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
