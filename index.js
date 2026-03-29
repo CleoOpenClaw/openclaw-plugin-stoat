@@ -9,6 +9,9 @@ import { readFile } from "node:fs/promises";
 
 const activeClients = new Map();
 const activeTokens = new Map(); // accountId -> current session token
+const tokenVerifiedAt = new Map(); // accountId -> timestamp of last successful /users/@me
+const TOKEN_VERIFY_TTL_MS = 5 * 60 * 1000; // re-verify at most every 5 minutes
+let rateLimitedUntil = 0; // epoch ms — skip token verify while rate limited
 let runtimeRef = null;
 
 function nowIso() {
@@ -94,6 +97,27 @@ async function sendStoatMessage({ token, apiBase, channelId, text, attachments }
       ...(typeof text === "string" ? { content: text } : {}),
       ...(Array.isArray(attachments) && attachments.length ? { attachments } : {}),
     },
+  });
+}
+
+// Add a reaction emoji to a message via the Revolt REST API.
+// PUT /channels/:channel/messages/:message/reactions/:emoji
+async function addStoatReaction({ token, apiBase, channelId, messageId, emoji }) {
+  return stoatApiRequest({
+    apiBase,
+    token,
+    method: "PUT",
+    path: `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(emoji)}`,
+  });
+}
+
+// Fetch a single message by ID (used to get original text for reaction context).
+async function fetchStoatMessage({ token, apiBase, channelId, messageId }) {
+  return stoatApiRequest({
+    apiBase,
+    token,
+    method: "GET",
+    path: `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`,
   });
 }
 
@@ -193,6 +217,16 @@ async function ensureFreshToken(account) {
   // Always use the latest cached token
   const cached = activeTokens.get(account.accountId);
   if (cached) account.token = cached;
+
+  const now = Date.now();
+
+  // Skip verification if we're in a rate-limit backoff window
+  if (now < rateLimitedUntil) return;
+
+  // Skip verification if we verified recently (TTL cache)
+  const lastVerified = tokenVerifiedAt.get(account.accountId) ?? 0;
+  if (now - lastVerified < TOKEN_VERIFY_TTL_MS) return;
+
   try {
     await stoatApiRequest({
       apiBase: account.apiBase,
@@ -200,12 +234,22 @@ async function ensureFreshToken(account) {
       method: "GET",
       path: "/users/@me",
     });
+    tokenVerifiedAt.set(account.accountId, now);
   } catch (err) {
-    if (/\b401\b/.test(String(err))) {
+    const errStr = String(err);
+    if (/\b429\b/.test(errStr)) {
+      // Extract retry_after if present, default to 60s
+      const match = errStr.match(/"retry_after"\s*:\s*(\d+)/);
+      const backoffSec = match ? parseInt(match[1], 10) : 60;
+      rateLimitedUntil = now + backoffSec * 1000;
+      // Don't throw — use existing token and hope it's still valid
+      return;
+    } else if (/\b401\b/.test(errStr)) {
       const freshToken = await loginToGetToken(account);
       if (freshToken) {
         account.token = freshToken;
         activeTokens.set(account.accountId, freshToken);
+        tokenVerifiedAt.set(account.accountId, now);
       } else {
         throw new Error("Token expired and re-login failed");
       }
@@ -368,8 +412,34 @@ async function dispatchInbound(ctx, account, payload, selfId, options = {}) {
       ...replyOptionsBase,
       humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId),
       deliver: async (replyPayload) => {
-        const text = String(replyPayload?.text ?? "").trim();
+        let text = String(replyPayload?.text ?? "").trim();
         const attachmentIds = [];
+
+        // Parse [react:<emoji>:<messageId>] tag — send a reaction instead of (or in addition to) text
+        const reactMatch = /^\[react:([^:]+):([^\]]+)\]\s*/.exec(text);
+        if (reactMatch) {
+          const reactEmoji = reactMatch[1];
+          const reactTargetId = reactMatch[2];
+          text = text.slice(reactMatch[0].length).trim();
+          try {
+            const sendToken = await loginToGetToken(account).catch(() => account.token);
+            if (sendToken) {
+              account.token = sendToken;
+              activeTokens.set(account.accountId, sendToken);
+            }
+            await addStoatReaction({
+              token: account.token,
+              apiBase: account.apiBase,
+              channelId: inbound.chatId,
+              messageId: reactTargetId,
+              emoji: reactEmoji,
+            });
+          } catch (err) {
+            logger?.warn?.(`stoat reaction failed for ${inbound.chatId}: ${String(err)}`);
+          }
+          // If no remaining text or media, we're done
+          if (!text && !replyPayload?.media && !replyPayload?.filePath && !replyPayload?.buffer) return;
+        }
 
         const uploadItem = async ({ bytes, filename, contentType }) => {
           try {
@@ -718,6 +788,48 @@ function createWsClient(ctx, account, selfId) {
         const channelId = String(event?.channel || event?.channel_id || "");
         await dispatchInbound(ctx, account, event, selfId, {
           channelType: state.channelTypeById.get(channelId),
+        });
+        break;
+      }
+      // Forward emoji reactions to Cleo as synthetic inbound messages
+      case "MessageReact": {
+        const reactUserId = event?.user_id || event?.user;
+        const reactMsgId = event?.id || event?.message_id;
+        const reactChannelId = event?.channel_id || event?.channel;
+        const reactEmoji = event?.emoji_id || event?.emoji || "";
+
+        if (!reactUserId || !reactMsgId || !reactChannelId) break;
+        // Ignore own reactions
+        if (selfId && String(reactUserId) === String(selfId)) break;
+
+        // Try to fetch the original message text for context
+        let originalText = "";
+        try {
+          const origMsg = await fetchStoatMessage({
+            token: account.token,
+            apiBase: account.apiBase,
+            channelId: reactChannelId,
+            messageId: reactMsgId,
+          });
+          originalText = typeof origMsg?.content === "string" ? origMsg.content : "";
+        } catch (err) {
+          ctx.log?.debug?.(`[${account.accountId}] could not fetch reacted message ${reactMsgId}: ${err}`);
+        }
+
+        // Build a synthetic message payload so dispatchInbound can handle it
+        const truncated = originalText.length > 120 ? originalText.slice(0, 120) + "…" : originalText;
+        const reactionBody = originalText
+          ? `[Reaction] reacted ${reactEmoji} to: "${truncated}"`
+          : `[Reaction] reacted ${reactEmoji}`;
+
+        const syntheticMsg = {
+          _id: `react-${reactMsgId}-${Date.now()}`,
+          channel: reactChannelId,
+          author: reactUserId,
+          content: reactionBody,
+        };
+        await dispatchInbound(ctx, account, syntheticMsg, selfId, {
+          channelType: state.channelTypeById.get(String(reactChannelId)),
         });
         break;
       }
