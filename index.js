@@ -416,11 +416,12 @@ async function dispatchInbound(ctx, account, payload, selfId, options = {}) {
         const attachmentIds = [];
 
         // Parse [react:<emoji>:<messageId>] tag — send a reaction instead of (or in addition to) text
-        const reactMatch = /^\[react:([^:]+):([^\]]+)\]\s*/.exec(text);
+        // Tag can appear anywhere in the text (start, end, or standalone)
+        const reactMatch = /\[react:([^:]+):([^\]]+)\]/.exec(text);
         if (reactMatch) {
           const reactEmoji = reactMatch[1];
           const reactTargetId = reactMatch[2];
-          text = text.slice(reactMatch[0].length).trim();
+          text = text.replace(reactMatch[0], "").trim();
           try {
             const sendToken = await loginToGetToken(account).catch(() => account.token);
             if (sendToken) {
